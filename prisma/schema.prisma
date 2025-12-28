@@ -1,0 +1,709 @@
+// VeloX Rideshare Database Schema
+// PostgreSQL with PostGIS for geospatial queries
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [postgis]
+}
+
+// ==================== USERS ====================
+
+model User {
+  id            String    @id @default(uuid())
+  email         String?   @unique
+  phone         String    @unique
+  phoneVerified Boolean   @default(false)
+  passwordHash  String?
+  
+  // Profile
+  firstName     String
+  lastName      String
+  avatarUrl     String?
+  
+  // Stripe
+  stripeCustomerId String?
+  
+  // Settings
+  notifyPush    Boolean   @default(true)
+  notifySms     Boolean   @default(true)
+  notifyEmail   Boolean   @default(true)
+  
+  // Status
+  status        UserStatus @default(ACTIVE)
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+  lastLoginAt   DateTime?
+  
+  // Relations
+  rides         Ride[]
+  paymentMethods PaymentMethod[]
+  ratings       Rating[]      @relation("RiderRatings")
+  savedPlaces   SavedPlace[]
+  promoUsages   PromoUsage[]
+  
+  @@index([phone])
+  @@index([email])
+  @@index([stripeCustomerId])
+}
+
+model SavedPlace {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  name      String   // "Home", "Work", etc.
+  address   String
+  latitude  Float
+  longitude Float
+  icon      String   @default("📍")
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  @@unique([userId, name])
+}
+
+// ==================== DRIVERS ====================
+
+model Driver {
+  id            String    @id @default(uuid())
+  email         String    @unique
+  phone         String    @unique
+  phoneVerified Boolean   @default(false)
+  passwordHash  String
+  
+  // Profile
+  firstName     String
+  lastName      String
+  avatarUrl     String?
+  dateOfBirth   DateTime?
+  
+  // Vehicle Info
+  vehicleMake   String
+  vehicleModel  String
+  vehicleYear   Int
+  vehicleColor  String
+  licensePlate  String
+  vehiclePhoto  String?
+  
+  // Documents
+  driversLicense      String?
+  driversLicenseExp   DateTime?
+  insurance           String?
+  insuranceExp        DateTime?
+  vehicleRegistration String?
+  backgroundCheckId   String?
+  backgroundCheckStatus BackgroundStatus @default(PENDING)
+  
+  // Stripe Connect
+  stripeAccountId     String?
+  stripeOnboarded     Boolean @default(false)
+  
+  // Stats
+  rating        Float     @default(5.0)
+  totalRides    Int       @default(0)
+  totalEarnings Decimal   @default(0) @db.Decimal(10, 2)
+  
+  // Status
+  status        DriverStatus @default(PENDING_APPROVAL)
+  isOnline      Boolean      @default(false)
+  currentLat    Float?
+  currentLng    Float?
+  lastLocationUpdate DateTime?
+  
+  // Service types driver can accept
+  serviceTypes  ServiceType[]
+  
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  approvedAt    DateTime?
+  
+  // Relations
+  rides         Ride[]
+  ratings       Rating[]       @relation("DriverRatings")
+  earnings      Earning[]
+  payoutMethods DriverPayoutMethod[]
+  payouts       Payout[]
+  documents     DriverDocument[]
+  
+  @@index([phone])
+  @@index([email])
+  @@index([stripeAccountId])
+  @@index([isOnline, status])
+}
+
+model DriverPayoutMethod {
+  id          String   @id @default(uuid())
+  driverId    String
+  driver      Driver   @relation(fields: [driverId], references: [id], onDelete: Cascade)
+  
+  type        PayoutMethodType
+  isDefault   Boolean  @default(false)
+  
+  // Bank details (encrypted in production)
+  bankName    String?
+  last4       String?
+  
+  // Stripe external account ID
+  stripeExternalAccountId String?
+  
+  createdAt   DateTime @default(now())
+  
+  @@index([driverId])
+}
+
+// ==================== RIDES ====================
+
+model Ride {
+  id            String    @id @default(uuid())
+  
+  // Participants
+  userId        String
+  user          User      @relation(fields: [userId], references: [id])
+  driverId      String?
+  driver        Driver?   @relation(fields: [driverId], references: [id])
+  
+  // Locations
+  pickupAddress   String
+  pickupLat       Float
+  pickupLng       Float
+  dropoffAddress  String
+  dropoffLat      Float
+  dropoffLng      Float
+  
+  // Route info
+  distanceMiles   Float?
+  durationMinutes Int?
+  routePolyline   String?   // Encoded polyline for route display
+  
+  // Service & Pricing
+  serviceType     ServiceType
+  baseFare        Decimal   @db.Decimal(10, 2)
+  distanceFare    Decimal   @db.Decimal(10, 2)
+  timeFare        Decimal   @db.Decimal(10, 2)
+  surgeMult       Float     @default(1.0)
+  tolls           Decimal   @default(0) @db.Decimal(10, 2)
+  tip             Decimal   @default(0) @db.Decimal(10, 2)
+  promoDiscount   Decimal   @default(0) @db.Decimal(10, 2)
+  totalFare       Decimal   @db.Decimal(10, 2)
+  
+  // Platform fees
+  platformFee     Decimal   @db.Decimal(10, 2)
+  driverEarnings  Decimal   @db.Decimal(10, 2)
+  
+  // Status & Timeline
+  status          RideStatus @default(REQUESTED)
+  requestedAt     DateTime   @default(now())
+  acceptedAt      DateTime?
+  arrivedAt       DateTime?
+  startedAt       DateTime?
+  completedAt     DateTime?
+  cancelledAt     DateTime?
+  cancelReason    String?
+  cancelledBy     CancelledBy?
+  
+  // Scheduling
+  isScheduled     Boolean    @default(false)
+  scheduledFor    DateTime?
+  
+  // Payment
+  paymentMethodId String?
+  paymentMethod   PaymentMethod? @relation(fields: [paymentMethodId], references: [id])
+  paymentStatus   PaymentStatus  @default(PENDING)
+  stripePaymentIntentId String?
+  
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  
+  // Relations
+  stops           RideStop[]
+  ratings         Rating[]
+  earning         Earning?
+  messages        Message[]
+  
+  @@index([userId])
+  @@index([driverId])
+  @@index([status])
+  @@index([isScheduled, scheduledFor])
+  @@index([createdAt])
+}
+
+model RideStop {
+  id        String   @id @default(uuid())
+  rideId    String
+  ride      Ride     @relation(fields: [rideId], references: [id], onDelete: Cascade)
+  
+  address   String
+  latitude  Float
+  longitude Float
+  order     Int      // Stop order (1, 2, etc.)
+  
+  arrivedAt   DateTime?
+  completedAt DateTime?
+  
+  @@index([rideId])
+}
+
+// ==================== PAYMENTS ====================
+
+model PaymentMethod {
+  id          String   @id @default(uuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  type        PaymentType
+  isDefault   Boolean  @default(false)
+  
+  // Card details
+  brand       String?  // visa, mastercard, amex
+  last4       String?
+  expMonth    Int?
+  expYear     Int?
+  
+  // Stripe
+  stripePaymentMethodId String?
+  
+  createdAt   DateTime @default(now())
+  
+  rides       Ride[]
+  
+  @@index([userId])
+  @@index([stripePaymentMethodId])
+}
+
+model Earning {
+  id          String   @id @default(uuid())
+  driverId    String
+  driver      Driver   @relation(fields: [driverId], references: [id])
+  rideId      String   @unique
+  ride        Ride     @relation(fields: [rideId], references: [id])
+  
+  grossAmount Decimal  @db.Decimal(10, 2)
+  platformFee Decimal  @db.Decimal(10, 2)
+  netAmount   Decimal  @db.Decimal(10, 2)
+  tip         Decimal  @default(0) @db.Decimal(10, 2)
+  
+  status      EarningStatus @default(PENDING)
+  paidOutAt   DateTime?
+  payoutId    String?
+  payout      Payout?  @relation(fields: [payoutId], references: [id])
+  
+  createdAt   DateTime @default(now())
+  
+  @@index([driverId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model Payout {
+  id          String   @id @default(uuid())
+  driverId    String
+  driver      Driver   @relation(fields: [driverId], references: [id])
+  
+  amount      Decimal  @db.Decimal(10, 2)
+  fee         Decimal  @default(0) @db.Decimal(10, 2) // Instant payout fee
+  netAmount   Decimal  @db.Decimal(10, 2)
+  
+  type        PayoutType
+  status      PayoutStatus @default(PENDING)
+  
+  // Stripe
+  stripeTransferId String?
+  stripePayoutId   String?
+  
+  processedAt DateTime?
+  failedAt    DateTime?
+  failReason  String?
+  
+  createdAt   DateTime @default(now())
+  
+  earnings    Earning[]
+  
+  @@index([driverId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+// ==================== RATINGS ====================
+
+model Rating {
+  id        String   @id @default(uuid())
+  rideId    String
+  ride      Ride     @relation(fields: [rideId], references: [id])
+  
+  // Who rated whom
+  fromUserId    String?
+  fromUser      User?    @relation("RiderRatings", fields: [fromUserId], references: [id])
+  fromDriverId  String?
+  fromDriver    Driver?  @relation("DriverRatings", fields: [fromDriverId], references: [id])
+  
+  toUserId      String?
+  toDriverId    String?
+  
+  rating    Int      // 1-5
+  comment   String?
+  
+  createdAt DateTime @default(now())
+  
+  @@index([rideId])
+  @@index([toUserId])
+  @@index([toDriverId])
+}
+
+// ==================== PROMOS ====================
+
+model PromoCode {
+  id            String   @id @default(uuid())
+  code          String   @unique
+  
+  type          PromoType
+  value         Decimal  @db.Decimal(10, 2) // Amount or percentage
+  maxDiscount   Decimal? @db.Decimal(10, 2) // Cap for percentage discounts
+  minRideFare   Decimal? @db.Decimal(10, 2) // Minimum fare to apply
+  
+  usageLimit    Int?     // Total uses allowed
+  usageCount    Int      @default(0)
+  perUserLimit  Int      @default(1)
+  
+  validFrom     DateTime @default(now())
+  validUntil    DateTime?
+  
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  
+  usages        PromoUsage[]
+  
+  @@index([code])
+  @@index([isActive, validFrom, validUntil])
+}
+
+model PromoUsage {
+  id          String    @id @default(uuid())
+  promoCodeId String
+  promoCode   PromoCode @relation(fields: [promoCodeId], references: [id])
+  userId      String
+  user        User      @relation(fields: [userId], references: [id])
+  
+  discountAmount Decimal @db.Decimal(10, 2)
+  usedAt         DateTime @default(now())
+  
+  @@index([promoCodeId])
+  @@index([userId])
+}
+
+// ==================== PLATFORM CONFIG ====================
+
+model PlatformConfig {
+  id    String @id @default("config")
+  
+  // Commission rates
+  platformCommissionPercent Float @default(20.0)
+  
+  // Instant payout
+  instantPayoutFeePercent   Float @default(1.5)
+  instantPayoutMinAmount    Decimal @default(5) @db.Decimal(10, 2)
+  
+  // Pricing per service type (stored as JSON)
+  // Format: { "VELOX": { baseFare: 5, perMile: 2.5, perMinute: 0.35, minFare: 8 }, ... }
+  pricingConfig Json
+  
+  // Surge settings
+  surgeEnabled    Boolean @default(true)
+  maxSurgeMultiplier Float @default(3.0)
+  
+  // Matching settings
+  maxMatchRadiusMiles Float @default(10.0)
+  matchTimeoutSeconds Int   @default(30)
+  
+  updatedAt DateTime @updatedAt
+}
+
+// ==================== ENUMS ====================
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  DELETED
+}
+
+enum DriverStatus {
+  PENDING_APPROVAL
+  APPROVED
+  SUSPENDED
+  REJECTED
+}
+
+enum BackgroundStatus {
+  PENDING
+  IN_PROGRESS
+  PASSED
+  FAILED
+}
+
+enum ServiceType {
+  VELOX       // Standard
+  VELOX_XL    // SUV/Large vehicle
+  VELOX_BLACK // Luxury
+  VELOX_GREEN // Electric/Hybrid
+}
+
+enum RideStatus {
+  REQUESTED     // User requested, finding driver
+  ACCEPTED      // Driver accepted
+  ARRIVING      // Driver en route to pickup
+  ARRIVED       // Driver at pickup location
+  IN_PROGRESS   // Trip started
+  COMPLETED     // Trip finished
+  CANCELLED     // Cancelled by rider or driver
+  NO_DRIVERS    // No drivers available
+}
+
+enum CancelledBy {
+  RIDER
+  DRIVER
+  SYSTEM
+}
+
+enum PaymentType {
+  CARD
+  APPLE_PAY
+  GOOGLE_PAY
+}
+
+enum PaymentStatus {
+  PENDING
+  AUTHORIZED
+  CAPTURED
+  FAILED
+  REFUNDED
+}
+
+enum PayoutMethodType {
+  BANK_ACCOUNT
+  DEBIT_CARD
+}
+
+enum PayoutType {
+  STANDARD  // Weekly automatic
+  INSTANT   // On-demand with fee
+}
+
+enum PayoutStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+enum EarningStatus {
+  PENDING     // Ride completed, awaiting payout
+  AVAILABLE   // Ready for payout
+  PAID_OUT    // Included in a payout
+}
+
+enum PromoType {
+  FIXED       // Fixed dollar amount off
+  PERCENTAGE  // Percentage off
+}
+
+// ==================== DEVICE TOKENS (Push Notifications) ====================
+
+model DeviceToken {
+  id          String   @id @default(uuid())
+  entityId    String   // userId or driverId
+  entityType  String   // 'user' or 'driver'
+  token       String
+  platform    String   // 'ios', 'android', 'web'
+  
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  
+  @@unique([entityId, entityType, token])
+  @@index([entityId, entityType])
+}
+
+// ==================== DRIVER DOCUMENTS ====================
+
+model DriverDocument {
+  id            String   @id @default(uuid())
+  driverId      String
+  driver        Driver   @relation(fields: [driverId], references: [id], onDelete: Cascade)
+  
+  type          DocumentType
+  filename      String
+  originalName  String
+  mimeType      String
+  size          Int
+  url           String
+  
+  status        DocumentStatus @default(PENDING_REVIEW)
+  reviewedAt    DateTime?
+  reviewNotes   String?
+  reviewerId    String?
+  
+  createdAt     DateTime @default(now())
+  
+  @@index([driverId])
+  @@index([type, status])
+}
+
+enum DocumentType {
+  DRIVERS_LICENSE
+  INSURANCE
+  VEHICLE_REGISTRATION
+  VEHICLE_PHOTO
+  PROFILE_PHOTO
+}
+
+enum DocumentStatus {
+  PENDING_REVIEW
+  APPROVED
+  REJECTED
+  EXPIRED
+}
+
+// ==================== IN-APP MESSAGING ====================
+
+model Message {
+  id          String   @id @default(uuid())
+  rideId      String
+  ride        Ride     @relation(fields: [rideId], references: [id], onDelete: Cascade)
+  
+  senderId    String
+  senderType  String   // 'user' or 'driver'
+  content     String
+  
+  status      MessageStatus @default(SENT)
+  deliveredAt DateTime?
+  readAt      DateTime?
+  
+  createdAt   DateTime @default(now())
+  
+  @@index([rideId])
+  @@index([senderId, senderType])
+}
+
+enum MessageStatus {
+  SENT
+  DELIVERED
+  READ
+}
+
+// ==================== SCHEDULED RIDES ====================
+
+model ScheduledRide {
+  id            String    @id @default(uuid())
+  userId        String
+  
+  pickupAddress   String
+  pickupLat       Float
+  pickupLng       Float
+  dropoffAddress  String
+  dropoffLat      Float
+  dropoffLng      Float
+  
+  serviceType     ServiceType
+  scheduledFor    DateTime
+  
+  // Assigned driver (if any)
+  driverId        String?
+  
+  status          ScheduledRideStatus @default(PENDING)
+  reminderSent    Boolean @default(false)
+  
+  // Converted to regular ride
+  rideId          String?  @unique
+  
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  
+  @@index([userId])
+  @@index([driverId])
+  @@index([scheduledFor])
+  @@index([status])
+}
+
+enum ScheduledRideStatus {
+  PENDING
+  DRIVER_ASSIGNED
+  CONVERTED   // Converted to active ride
+  CANCELLED
+}
+
+// ==================== SUPPORT TICKETS ====================
+
+model SupportTicket {
+  id          String   @id @default(uuid())
+  
+  // Who submitted
+  userId      String?
+  driverId    String?
+  
+  // Related ride (if applicable)
+  rideId      String?
+  
+  subject     String
+  description String
+  category    TicketCategory
+  priority    TicketPriority @default(MEDIUM)
+  status      TicketStatus   @default(OPEN)
+  
+  // Assignment
+  assignedTo  String?
+  
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  resolvedAt  DateTime?
+  
+  responses   TicketResponse[]
+  
+  @@index([userId])
+  @@index([driverId])
+  @@index([status])
+}
+
+model TicketResponse {
+  id          String   @id @default(uuid())
+  ticketId    String
+  ticket      SupportTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  
+  responderId String
+  responderType String // 'user', 'driver', 'admin'
+  content     String
+  
+  createdAt   DateTime @default(now())
+  
+  @@index([ticketId])
+}
+
+enum TicketCategory {
+  RIDE_ISSUE
+  PAYMENT
+  DRIVER_COMPLAINT
+  RIDER_COMPLAINT
+  LOST_ITEM
+  SAFETY
+  ACCOUNT
+  OTHER
+}
+
+enum TicketPriority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+enum TicketStatus {
+  OPEN
+  IN_PROGRESS
+  WAITING_RESPONSE
+  RESOLVED
+  CLOSED
+}
