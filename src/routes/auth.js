@@ -157,23 +157,29 @@ router.post('/rider/verify-code',
 router.post('/rider/google',
   body('idToken').notEmpty(),
   asyncHandler(async (req, res) => {
-    const { idToken, phone } = req.body;
-    
-    // In production, verify Google ID token
-    // For now, extract user info from token payload
-    // const ticket = await googleClient.verifyIdToken({ idToken, audience: GOOGLE_CLIENT_ID });
-    // const payload = ticket.getPayload();
-    
-    // Mock Google auth for development
-    const googleUser = {
-      email: req.body.email,
-      firstName: req.body.firstName || 'Google',
-      lastName: req.body.lastName || 'User',
-    };
-
-    if (!googleUser.email) {
-      return res.status(400).json({ error: 'Email required from Google account' });
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
     }
+
+    const { idToken, phone } = req.body;
+    let googleUser;
+
+    if (process.env.NODE_ENV === 'development' && !process.env.GOOGLE_CLIENT_ID) {
+      // Development fallback when Google auth is not configured.
+      googleUser = {
+        email: req.body.email,
+        firstName: req.body.firstName || 'Google',
+        lastName: req.body.lastName || 'User',
+      };
+    } else {
+      googleUser = await verifyGoogleIdToken(idToken, process.env.GOOGLE_CLIENT_ID);
+    }
+
+    if (!googleUser || !googleUser.email) {
+      return res.status(401).json({ error: 'Invalid Google ID token' });
+    }
+    googleUser.email = googleUser.email.toLowerCase();
 
     // Find or create user
     let user = await prisma.user.findUnique({
@@ -304,6 +310,11 @@ router.post('/driver/login',
   body('email').isEmail(),
   body('password').notEmpty(),
   asyncHandler(async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
     const { email, password } = req.body;
 
     const driver = await prisma.driver.findUnique({
@@ -376,6 +387,11 @@ router.post('/driver/login',
 router.post('/refresh',
   body('refreshToken').notEmpty(),
   asyncHandler(async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
     const { refreshToken } = req.body;
 
     const decoded = verifyRefreshToken(refreshToken);
@@ -421,6 +437,39 @@ function formatPhone(phone) {
     return `+${digits}`;
   }
   return `+${digits}`;
+}
+
+async function verifyGoogleIdToken(idToken, expectedAudience) {
+  try {
+    const tokenInfoUrl = `https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(idToken)}`;
+    const response = await fetch(tokenInfoUrl);
+    if (!response.ok) {
+      return null;
+    }
+
+    const payload = await response.json();
+
+    if (expectedAudience && payload.aud !== expectedAudience) {
+      return null;
+    }
+
+    if (payload.email_verified !== 'true') {
+      return null;
+    }
+
+    const exp = Number(payload.exp);
+    if (!Number.isFinite(exp) || exp * 1000 <= Date.now()) {
+      return null;
+    }
+
+    return {
+      email: payload.email,
+      firstName: payload.given_name || 'Google',
+      lastName: payload.family_name || 'User'
+    };
+  } catch (err) {
+    return null;
+  }
 }
 
 module.exports = router;

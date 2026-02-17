@@ -135,10 +135,25 @@ router.post('/request',
 
     // Apply promo code if provided
     let promoDiscount = 0;
+    let appliedPromo = null;
     if (promoCode) {
       const promo = await validatePromoCode(promoCode, userId, fareDetails.totalFare);
       if (promo.valid) {
         promoDiscount = promo.discount;
+        appliedPromo = promo;
+      } else {
+        return res.status(400).json({ error: promo.error || 'Invalid promo code' });
+      }
+    }
+
+    if (paymentMethodId) {
+      const paymentMethod = await prisma.paymentMethod.findFirst({
+        where: { id: paymentMethodId, userId },
+        select: { id: true }
+      });
+
+      if (!paymentMethod) {
+        return res.status(400).json({ error: 'Invalid payment method' });
       }
     }
 
@@ -148,43 +163,62 @@ router.post('/request',
     const platformFee = totalFare * (platformFeePercent / 100);
     const driverEarnings = totalFare - platformFee;
 
-    // Create ride
-    const ride = await prisma.ride.create({
-      data: {
-        userId,
-        pickupAddress,
-        pickupLat,
-        pickupLng,
-        dropoffAddress,
-        dropoffLat,
-        dropoffLng,
-        distanceMiles: distance,
-        durationMinutes: duration,
-        serviceType,
-        baseFare: fareDetails.baseFare,
-        distanceFare: fareDetails.distanceFare,
-        timeFare: fareDetails.timeFare,
-        surgeMult: surgeMultiplier,
-        promoDiscount,
-        totalFare,
-        platformFee,
-        driverEarnings,
-        paymentMethodId,
-        isScheduled: !!scheduledFor,
-        scheduledFor: scheduledFor ? new Date(scheduledFor) : null,
-        status: scheduledFor ? 'REQUESTED' : 'REQUESTED',
-        stops: {
-          create: stops.map((stop, index) => ({
-            address: stop.address,
-            latitude: stop.lat,
-            longitude: stop.lng,
-            order: index + 1
-          }))
+    // Create ride and promo usage atomically.
+    const ride = await prisma.$transaction(async (tx) => {
+      const createdRide = await tx.ride.create({
+        data: {
+          userId,
+          pickupAddress,
+          pickupLat,
+          pickupLng,
+          dropoffAddress,
+          dropoffLat,
+          dropoffLng,
+          distanceMiles: distance,
+          durationMinutes: duration,
+          serviceType,
+          baseFare: fareDetails.baseFare,
+          distanceFare: fareDetails.distanceFare,
+          timeFare: fareDetails.timeFare,
+          surgeMult: surgeMultiplier,
+          promoDiscount,
+          totalFare,
+          platformFee,
+          driverEarnings,
+          paymentMethodId,
+          isScheduled: !!scheduledFor,
+          scheduledFor: scheduledFor ? new Date(scheduledFor) : null,
+          status: 'REQUESTED',
+          stops: {
+            create: stops.map((stop, index) => ({
+              address: stop.address,
+              latitude: stop.lat,
+              longitude: stop.lng,
+              order: index + 1
+            }))
+          }
+        },
+        include: {
+          stops: true
         }
-      },
-      include: {
-        stops: true
+      });
+
+      if (appliedPromo) {
+        await tx.promoUsage.create({
+          data: {
+            promoCodeId: appliedPromo.promoId,
+            userId,
+            discountAmount: promoDiscount
+          }
+        });
+
+        await tx.promoCode.update({
+          where: { id: appliedPromo.promoId },
+          data: { usageCount: { increment: 1 } }
+        });
       }
+
+      return createdRide;
     });
 
     // Store ride state in Redis for real-time access
@@ -243,6 +277,11 @@ router.post('/request',
 router.get('/:id',
   param('id').isUUID(),
   asyncHandler(async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
     const { id } = req.params;
     const userId = req.user.id;
     const userType = req.user.type;
@@ -367,6 +406,11 @@ router.post('/:id/cancel',
   param('id').isUUID(),
   body('reason').optional().isString(),
   asyncHandler(async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
     const { id } = req.params;
     const { reason } = req.body;
     const userId = req.user.id;
@@ -445,8 +489,13 @@ router.post('/:id/tip',
   param('id').isUUID(),
   body('amount').isFloat({ min: 0, max: 100 }),
   asyncHandler(async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
     const { id } = req.params;
-    const { amount } = req.body;
+    const amount = Number(req.body.amount);
     const userId = req.user.id;
 
     const ride = await prisma.ride.findUnique({
@@ -495,8 +544,14 @@ router.post('/:id/rate',
   body('rating').isInt({ min: 1, max: 5 }),
   body('comment').optional().isString(),
   asyncHandler(async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
     const { id } = req.params;
-    const { rating, comment } = req.body;
+    const rating = Number.parseInt(req.body.rating, 10);
+    const { comment } = req.body;
     const userId = req.user.id;
     const userType = req.user.type;
 
@@ -525,6 +580,14 @@ router.post('/:id/rate',
       if (ride.userId !== userId) {
         return res.status(403).json({ error: 'Access denied' });
       }
+
+      const existing = await prisma.rating.findFirst({
+        where: { rideId: id, fromUserId: userId }
+      });
+      if (existing) {
+        return res.status(409).json({ error: 'You have already rated this ride' });
+      }
+
       ratingData.fromUserId = userId;
       ratingData.toDriverId = ride.driverId;
     } else {
@@ -532,6 +595,14 @@ router.post('/:id/rate',
       if (ride.driverId !== userId) {
         return res.status(403).json({ error: 'Access denied' });
       }
+
+      const existing = await prisma.rating.findFirst({
+        where: { rideId: id, fromDriverId: userId }
+      });
+      if (existing) {
+        return res.status(409).json({ error: 'You have already rated this ride' });
+      }
+
       ratingData.fromDriverId = userId;
       ratingData.toUserId = ride.userId;
     }
@@ -571,6 +642,8 @@ router.get('/',
     const userId = req.user.id;
     const userType = req.user.type;
     const { limit = 20, offset = 0, status } = req.query;
+    const parsedLimit = Math.min(Math.max(Number.parseInt(limit, 10) || 20, 1), 100);
+    const parsedOffset = Math.max(Number.parseInt(offset, 10) || 0, 0);
 
     const where = userType === 'user' 
       ? { userId }
@@ -584,8 +657,8 @@ router.get('/',
       prisma.ride.findMany({
         where,
         orderBy: { createdAt: 'desc' },
-        take: parseInt(limit),
-        skip: parseInt(offset),
+        take: parsedLimit,
+        skip: parsedOffset,
         include: {
           driver: userType === 'user' ? {
             select: {
@@ -627,8 +700,8 @@ router.get('/',
         } : null
       })),
       total,
-      limit: parseInt(limit),
-      offset: parseInt(offset)
+      limit: parsedLimit,
+      offset: parsedOffset
     });
   })
 );
@@ -672,6 +745,11 @@ async function validatePromoCode(code, userId, fareAmount) {
   }
 
   // Check expiry
+  if (promo.validFrom && promo.validFrom > new Date()) {
+    return { valid: false, error: 'Promo code is not active yet' };
+  }
+
+  // Check expiry
   if (promo.validUntil && promo.validUntil < new Date()) {
     return { valid: false, error: 'Promo code expired' };
   }
@@ -705,7 +783,7 @@ async function validatePromoCode(code, userId, fareAmount) {
     }
   }
 
-  return { valid: true, discount };
+  return { valid: true, discount, promoId: promo.id };
 }
 
 /**

@@ -55,10 +55,16 @@ router.get('/me', authenticateToken, requireUserType('driver'), asyncHandler(asy
 
 // Update driver location
 router.post('/location', authenticateToken, requireUserType('driver'),
-  body('lat').isFloat(),
-  body('lng').isFloat(),
+  body('lat').isFloat({ min: -90, max: 90 }),
+  body('lng').isFloat({ min: -180, max: 180 }),
   asyncHandler(async (req, res) => {
-    const { lat, lng } = req.body;
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    const lat = Number(req.body.lat);
+    const lng = Number(req.body.lng);
     
     await prisma.driver.update({
       where: { id: req.user.id },
@@ -72,20 +78,32 @@ router.post('/location', authenticateToken, requireUserType('driver'),
 
 // Go online/offline
 router.post('/status', authenticateToken, requireUserType('driver'),
-  body('online').isBoolean(),
+  body('online').isBoolean().toBoolean(),
   asyncHandler(async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
     const { online, lat, lng } = req.body;
+    const latitude = lat !== undefined ? Number(lat) : null;
+    const longitude = lng !== undefined ? Number(lng) : null;
+    const hasCoords = Number.isFinite(latitude) && Number.isFinite(longitude);
+
+    if (online && !hasCoords) {
+      return res.status(400).json({ error: 'lat and lng are required to go online' });
+    }
     
     await prisma.driver.update({
       where: { id: req.user.id },
       data: { 
         isOnline: online,
-        ...(lat && lng ? { currentLat: lat, currentLng: lng, lastLocationUpdate: new Date() } : {})
+        ...(hasCoords ? { currentLat: latitude, currentLng: longitude, lastLocationUpdate: new Date() } : {})
       }
     });
     
-    if (online && lat && lng) {
-      await redis.updateDriverLocation(req.user.id, lat, lng);
+    if (online && hasCoords) {
+      await redis.updateDriverLocation(req.user.id, latitude, longitude);
     } else {
       await redis.removeDriverFromPool(req.user.id);
     }
@@ -139,12 +157,9 @@ router.get('/earnings', authenticateToken, requireUserType('driver'), asyncHandl
 router.get('/requests', authenticateToken, requireUserType('driver'), asyncHandler(async (req, res) => {
   const driver = await prisma.driver.findUnique({ where: { id: req.user.id } });
   
-  if (!driver.isOnline) {
+  if (!driver.isOnline || !Number.isFinite(driver.currentLat) || !Number.isFinite(driver.currentLng)) {
     return res.json({ requests: [] });
   }
-  
-  // Find rides near driver
-  const nearbyRequests = await redis.findNearbyDrivers(driver.currentLat, driver.currentLng, 10);
   
   const rides = await prisma.ride.findMany({
     where: {

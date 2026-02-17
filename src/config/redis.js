@@ -119,15 +119,19 @@ async function removeDriverFromPool(driverId) {
 async function getAllOnlineDrivers() {
   const client = getRedisClient();
   
-  // Get all members with their positions
-  const positions = await client.geopos(KEYS.DRIVER_ONLINE, await client.zrange(KEYS.DRIVER_ONLINE, 0, -1));
   const driverIds = await client.zrange(KEYS.DRIVER_ONLINE, 0, -1);
+  if (driverIds.length === 0) {
+    return [];
+  }
+
+  // Get all members with their positions
+  const positions = await client.geopos(KEYS.DRIVER_ONLINE, ...driverIds);
   
   return driverIds.map((id, i) => ({
     driverId: id,
     lng: positions[i] ? parseFloat(positions[i][0]) : null,
     lat: positions[i] ? parseFloat(positions[i][1]) : null
-  })).filter(d => d.lat && d.lng);
+  })).filter(d => Number.isFinite(d.lat) && Number.isFinite(d.lng));
 }
 
 // ===========================================

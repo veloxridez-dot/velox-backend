@@ -5,10 +5,20 @@
 
 const express = require('express');
 const router = express.Router();
-const { body, validationResult } = require('express-validator');
+const { body, param, validationResult } = require('express-validator');
 const prisma = require('../config/prisma');
 const { asyncHandler } = require('../middleware/errorHandler');
 const { authenticateToken } = require('../middleware/auth');
+
+function canAccessTicket(ticket, user) {
+  if (user.type === 'user') {
+    return ticket.userId === user.id;
+  }
+  if (user.type === 'driver') {
+    return ticket.driverId === user.id;
+  }
+  return false;
+}
 
 // Create support ticket
 router.post('/',
@@ -17,6 +27,7 @@ router.post('/',
   body('description').notEmpty().isLength({ max: 5000 }),
   body('category').isIn(['RIDE_ISSUE', 'PAYMENT', 'DRIVER_COMPLAINT', 'RIDER_COMPLAINT', 'LOST_ITEM', 'SAFETY', 'ACCOUNT', 'OTHER']),
   body('rideId').optional().isUUID(),
+  body('priority').optional().isIn(['LOW', 'MEDIUM', 'HIGH', 'URGENT']),
   asyncHandler(async (req, res) => {
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
@@ -73,7 +84,13 @@ router.get('/',
 // Get single ticket
 router.get('/:id',
   authenticateToken,
+  param('id').isUUID(),
   asyncHandler(async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
     const ticket = await prisma.supportTicket.findUnique({
       where: { id: req.params.id },
       include: {
@@ -100,14 +117,24 @@ router.get('/:id',
 // Add response to ticket
 router.post('/:id/respond',
   authenticateToken,
+  param('id').isUUID(),
   body('content').notEmpty().isLength({ max: 5000 }),
   asyncHandler(async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
     const ticket = await prisma.supportTicket.findUnique({
       where: { id: req.params.id }
     });
     
     if (!ticket) {
       return res.status(404).json({ error: 'Ticket not found' });
+    }
+
+    if (!canAccessTicket(ticket, req.user)) {
+      return res.status(403).json({ error: 'Access denied' });
     }
     
     const response = await prisma.ticketResponse.create({
@@ -132,7 +159,25 @@ router.post('/:id/respond',
 // Close ticket
 router.post('/:id/close',
   authenticateToken,
+  param('id').isUUID(),
   asyncHandler(async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    const existingTicket = await prisma.supportTicket.findUnique({
+      where: { id: req.params.id }
+    });
+
+    if (!existingTicket) {
+      return res.status(404).json({ error: 'Ticket not found' });
+    }
+
+    if (!canAccessTicket(existingTicket, req.user)) {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
     const ticket = await prisma.supportTicket.update({
       where: { id: req.params.id },
       data: { 

@@ -7,17 +7,28 @@ const express = require('express');
 const router = express.Router();
 const prisma = require('../config/prisma');
 
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const stripeSecretKey = process.env.STRIPE_SECRET_KEY;
+const stripe = stripeSecretKey ? require('stripe')(stripeSecretKey) : null;
 const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
 
 router.post('/', async (req, res) => {
   let event;
   
+  if (!stripe) {
+    return res.status(503).json({ error: 'Stripe is not configured' });
+  }
+
   try {
     if (webhookSecret) {
       const sig = req.headers['stripe-signature'];
+      if (!sig) {
+        return res.status(400).send('Webhook Error: Missing stripe-signature header');
+      }
       event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+    } else if (process.env.NODE_ENV === 'production') {
+      return res.status(503).json({ error: 'Stripe webhook secret is not configured' });
     } else {
+      console.warn('⚠️ Processing unsigned Stripe webhook in non-production mode.');
       event = req.body;
     }
   } catch (err) {
