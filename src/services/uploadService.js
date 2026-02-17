@@ -14,6 +14,13 @@ const STORAGE_TYPE = process.env.STORAGE_TYPE || 'local'; // 's3', 'gcs', or 'lo
 const UPLOAD_DIR = process.env.UPLOAD_DIR || './uploads';
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
 const ALLOWED_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'];
+const DOCUMENT_TYPES = ['DRIVERS_LICENSE', 'INSURANCE', 'VEHICLE_REGISTRATION', 'VEHICLE_PHOTO', 'PROFILE_PHOTO'];
+const MIME_EXTENSION_MAP = {
+  'image/jpeg': '.jpg',
+  'image/png': '.png',
+  'image/webp': '.webp',
+  'application/pdf': '.pdf'
+};
 
 // AWS S3 setup (if using S3)
 let s3Client = null;
@@ -34,6 +41,8 @@ if (STORAGE_TYPE === 's3' && process.env.AWS_ACCESS_KEY_ID) {
  * Upload a document
  */
 async function uploadDocument(driverId, documentType, fileBuffer, mimeType, originalName) {
+  validateDocumentType(documentType);
+
   // Validate file
   if (!ALLOWED_TYPES.includes(mimeType)) {
     throw new Error(`Invalid file type. Allowed: ${ALLOWED_TYPES.join(', ')}`);
@@ -44,7 +53,8 @@ async function uploadDocument(driverId, documentType, fileBuffer, mimeType, orig
   }
   
   // Generate unique filename
-  const ext = path.extname(originalName) || '.jpg';
+  const normalizedOriginalName = path.basename(originalName || 'document');
+  const ext = MIME_EXTENSION_MAP[mimeType] || path.extname(normalizedOriginalName).toLowerCase() || '.bin';
   const filename = `${driverId}/${documentType}_${uuidv4()}${ext}`;
   
   let url;
@@ -61,7 +71,7 @@ async function uploadDocument(driverId, documentType, fileBuffer, mimeType, orig
       driverId,
       type: documentType,
       filename,
-      originalName,
+      originalName: normalizedOriginalName,
       mimeType,
       size: fileBuffer.length,
       url,
@@ -121,7 +131,12 @@ async function uploadToLocal(filename, buffer) {
 /**
  * Get signed URL for private document access
  */
-async function getDocumentUrl(documentId, expiresIn = 3600) {
+async function getDocumentUrl(documentId, requester = null, expiresIn = 3600) {
+  if (typeof requester === 'number') {
+    expiresIn = requester;
+    requester = null;
+  }
+
   const document = await prisma.driverDocument.findUnique({
     where: { id: documentId }
   });
@@ -129,6 +144,8 @@ async function getDocumentUrl(documentId, expiresIn = 3600) {
   if (!document) {
     throw new Error('Document not found');
   }
+
+  assertDocumentAccess(document, requester);
   
   if (STORAGE_TYPE === 's3' && s3Client) {
     const { GetObjectCommand } = require('@aws-sdk/client-s3');
@@ -136,7 +153,7 @@ async function getDocumentUrl(documentId, expiresIn = 3600) {
     
     const command = new GetObjectCommand({
       Bucket: process.env.S3_BUCKET,
-      Key: document.url.replace(`s3://${process.env.S3_BUCKET}/`, '')
+      Key: `documents/${document.filename}`
     });
     
     return getSignedUrl(s3Client, command, { expiresIn });
@@ -149,7 +166,7 @@ async function getDocumentUrl(documentId, expiresIn = 3600) {
 /**
  * Delete a document
  */
-async function deleteDocument(documentId) {
+async function deleteDocument(documentId, requester = null) {
   const document = await prisma.driverDocument.findUnique({
     where: { id: documentId }
   });
@@ -157,6 +174,8 @@ async function deleteDocument(documentId) {
   if (!document) {
     throw new Error('Document not found');
   }
+
+  assertDocumentAccess(document, requester);
   
   // Delete from storage
   if (STORAGE_TYPE === 's3' && s3Client) {
@@ -164,12 +183,12 @@ async function deleteDocument(documentId) {
     
     const command = new DeleteObjectCommand({
       Bucket: process.env.S3_BUCKET,
-      Key: document.url.replace(`s3://${process.env.S3_BUCKET}/`, '')
+      Key: `documents/${document.filename}`
     });
     
     await s3Client.send(command);
   } else {
-    const filePath = path.join(UPLOAD_DIR, document.url.replace('/uploads/', ''));
+    const filePath = path.join(UPLOAD_DIR, 'documents', document.filename);
     await fs.unlink(filePath).catch(() => {});
   }
   
@@ -262,6 +281,30 @@ function getDriverField(documentType) {
   return mapping[documentType];
 }
 
+function validateDocumentType(documentType) {
+  if (!DOCUMENT_TYPES.includes(documentType)) {
+    const err = new Error(`Invalid document type. Allowed: ${DOCUMENT_TYPES.join(', ')}`);
+    err.statusCode = 400;
+    throw err;
+  }
+}
+
+function assertDocumentAccess(document, requester) {
+  if (!requester) {
+    return;
+  }
+
+  if (requester.type === 'admin') {
+    return;
+  }
+
+  if (requester.type !== 'driver' || requester.id !== document.driverId) {
+    const err = new Error('Access denied');
+    err.statusCode = 403;
+    throw err;
+  }
+}
+
 module.exports = {
   uploadDocument,
   getDocumentUrl,
@@ -269,6 +312,7 @@ module.exports = {
   getDriverDocuments,
   reviewDocument,
   checkDocumentRequirements,
+  DOCUMENT_TYPES,
   ALLOWED_TYPES,
   MAX_FILE_SIZE
 };

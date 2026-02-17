@@ -6,6 +6,7 @@
 const express = require('express');
 const router = express.Router();
 const multer = require('multer');
+const { body, param, validationResult } = require('express-validator');
 const { asyncHandler } = require('../middleware/errorHandler');
 const { authenticateToken, requireUserType } = require('../middleware/auth');
 const uploadService = require('../services/uploadService');
@@ -29,15 +30,18 @@ router.post('/',
   authenticateToken, 
   requireUserType('driver'),
   upload.single('document'),
+  body('type').isIn(uploadService.DOCUMENT_TYPES),
   asyncHandler(async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
     if (!req.file) {
       return res.status(400).json({ error: 'No file uploaded' });
     }
     
     const { type } = req.body;
-    if (!type) {
-      return res.status(400).json({ error: 'Document type required' });
-    }
     
     const result = await uploadService.uploadDocument(
       req.user.id,
@@ -66,8 +70,15 @@ router.get('/',
 // Get signed URL for a document
 router.get('/:id/url', 
   authenticateToken,
+  requireUserType('driver'),
+  param('id').isUUID(),
   asyncHandler(async (req, res) => {
-    const url = await uploadService.getDocumentUrl(req.params.id);
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    const url = await uploadService.getDocumentUrl(req.params.id, req.user);
     res.json({ url });
   })
 );
@@ -76,8 +87,14 @@ router.get('/:id/url',
 router.delete('/:id', 
   authenticateToken, 
   requireUserType('driver'),
+  param('id').isUUID(),
   asyncHandler(async (req, res) => {
-    await uploadService.deleteDocument(req.params.id);
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    await uploadService.deleteDocument(req.params.id, req.user);
     res.json({ success: true });
   })
 );

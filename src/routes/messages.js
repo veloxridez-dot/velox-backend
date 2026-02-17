@@ -47,6 +47,11 @@ router.get('/:rideId',
   authenticateToken,
   param('rideId').isUUID(),
   asyncHandler(async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
     const messages = await messagingService.getMessages(
       req.params.rideId,
       req.user.id,
@@ -59,9 +64,15 @@ router.get('/:rideId',
 
 // Get quick message templates
 router.get('/templates/:userType',
+  param('userType').isIn(['rider', 'user', 'driver']),
   asyncHandler(async (req, res) => {
-    const { userType } = req.params;
-    const templates = messagingService.getQuickMessages(userType);
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    const normalizedUserType = req.params.userType === 'user' ? 'rider' : req.params.userType;
+    const templates = messagingService.getQuickMessages(normalizedUserType);
     res.json({ templates });
   })
 );
@@ -69,10 +80,17 @@ router.get('/templates/:userType',
 // Get unread count
 router.get('/:rideId/unread',
   authenticateToken,
+  param('rideId').isUUID(),
   asyncHandler(async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
     const count = await messagingService.getUnreadCount(
       req.params.rideId,
-      req.user.id
+      req.user.id,
+      req.user.type
     );
     res.json({ unread: count });
   })

@@ -21,7 +21,7 @@ function errorHandler(err, req, res, next) {
   }
 
   // Determine status code
-  let statusCode = res.statusCode === 200 ? 500 : res.statusCode;
+  let statusCode = err.statusCode || (res.statusCode === 200 ? 500 : res.statusCode);
   
   // Handle specific error types
   if (err.name === 'ValidationError') {

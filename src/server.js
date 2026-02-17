@@ -29,9 +29,18 @@ const { initErrorTracking, getErrorHandler, requestLogger } = require('./service
 const { initFirebase } = require('./services/pushService');
 const { errorHandler, notFound } = require('./middleware/errorHandler');
 const { authenticateToken } = require('./middleware/auth');
+const { getAllowedOrigins, isOriginAllowed, safeCompare } = require('./config/security');
 
 const app = express();
 const server = http.createServer(app);
+const allowedOrigins = getAllowedOrigins();
+
+function corsOriginHandler(origin, callback) {
+  if (isOriginAllowed(origin, allowedOrigins)) {
+    return callback(null, true);
+  }
+  return callback(new Error('Origin not allowed by CORS'));
+}
 
 // Initialize services
 initErrorTracking(app);
@@ -39,14 +48,23 @@ initFirebase();
 
 // Socket.io
 const io = new Server(server, {
-  cors: { origin: process.env.FRONTEND_URL || '*', methods: ['GET', 'POST'], credentials: true },
+  cors: {
+    origin: corsOriginHandler,
+    methods: ['GET', 'POST'],
+    credentials: true
+  },
   pingTimeout: 60000, pingInterval: 25000
 });
 app.set('io', io);
 
 // Middleware
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
-app.use(cors({ origin: process.env.FRONTEND_URL || '*', credentials: true, methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization'] }));
+app.use(cors({
+  origin: corsOriginHandler,
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
 app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 100, message: { error: 'Too many requests' }, standardHeaders: true, legacyHeaders: false }));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
@@ -70,6 +88,17 @@ app.use('/api/admin', adminRoutes);
 // Webhooks
 app.use('/webhooks/stripe', express.raw({ type: 'application/json' }), require('./routes/webhooks'));
 app.post('/webhooks/checkr', express.json(), async (req, res) => {
+  const checkrWebhookSecret = process.env.CHECKR_WEBHOOK_SECRET;
+
+  if (checkrWebhookSecret) {
+    const signature = req.headers['x-checkr-signature'];
+    if (typeof signature !== 'string' || !safeCompare(signature, checkrWebhookSecret)) {
+      return res.status(401).json({ error: 'Invalid Checkr webhook signature' });
+    }
+  } else if (process.env.NODE_ENV === 'production') {
+    return res.status(503).json({ error: 'Checkr webhook secret is not configured' });
+  }
+
   try {
     const bgService = require('./services/backgroundCheckService');
     await bgService.handleCheckrWebhook(req.body);

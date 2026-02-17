@@ -5,13 +5,22 @@
 
 const express = require('express');
 const router = express.Router();
-const { body, validationResult } = require('express-validator');
+const { body, param, validationResult } = require('express-validator');
 const prisma = require('../config/prisma');
 const { asyncHandler } = require('../middleware/errorHandler');
 const { requireUserType } = require('../middleware/auth');
 
 // Initialize Stripe
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const stripeSecretKey = process.env.STRIPE_SECRET_KEY;
+const stripe = stripeSecretKey ? require('stripe')(stripeSecretKey) : null;
+
+function ensureStripeConfigured(res) {
+  if (!stripe) {
+    res.status(503).json({ error: 'Stripe is not configured' });
+    return false;
+  }
+  return true;
+}
 
 // ===========================================
 // RIDER PAYMENT METHODS
@@ -30,7 +39,21 @@ router.get('/methods', requireUserType('user'), asyncHandler(async (req, res) =>
 router.post('/methods', requireUserType('user'),
   body('paymentMethodId').notEmpty(),
   asyncHandler(async (req, res) => {
+    if (!ensureStripeConfigured(res)) return;
+
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
     const { paymentMethodId } = req.body;
+
+    const existing = await prisma.paymentMethod.findFirst({
+      where: { userId: req.user.id, stripePaymentMethodId: paymentMethodId }
+    });
+    if (existing) {
+      return res.status(409).json({ error: 'Payment method already added' });
+    }
     
     // Get user's Stripe customer ID or create one
     let user = await prisma.user.findUnique({ where: { id: req.user.id } });
@@ -78,19 +101,47 @@ router.post('/methods', requireUserType('user'),
 );
 
 // Set default payment method
-router.post('/methods/:id/default', requireUserType('user'), asyncHandler(async (req, res) => {
-  await prisma.paymentMethod.updateMany({ where: { userId: req.user.id }, data: { isDefault: false } });
-  await prisma.paymentMethod.update({ where: { id: req.params.id, userId: req.user.id }, data: { isDefault: true } });
+router.post('/methods/:id/default',
+  requireUserType('user'),
+  param('id').isUUID(),
+  asyncHandler(async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ errors: errors.array() });
+  }
+
+  const method = await prisma.paymentMethod.findFirst({
+    where: { id: req.params.id, userId: req.user.id },
+    select: { id: true }
+  });
+
+  if (!method) {
+    return res.status(404).json({ error: 'Payment method not found' });
+  }
+
+  await prisma.$transaction([
+    prisma.paymentMethod.updateMany({ where: { userId: req.user.id }, data: { isDefault: false } }),
+    prisma.paymentMethod.update({ where: { id: method.id }, data: { isDefault: true } })
+  ]);
+
   res.json({ success: true });
 }));
 
 // Delete payment method
-router.delete('/methods/:id', requireUserType('user'), asyncHandler(async (req, res) => {
+router.delete('/methods/:id',
+  requireUserType('user'),
+  param('id').isUUID(),
+  asyncHandler(async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ errors: errors.array() });
+  }
+
   const method = await prisma.paymentMethod.findFirst({ where: { id: req.params.id, userId: req.user.id } });
   if (!method) return res.status(404).json({ error: 'Payment method not found' });
   
   // Detach from Stripe
-  if (method.stripePaymentMethodId) {
+  if (method.stripePaymentMethodId && stripe) {
     await stripe.paymentMethods.detach(method.stripePaymentMethodId).catch(() => {});
   }
   
@@ -104,6 +155,8 @@ router.delete('/methods/:id', requireUserType('user'), asyncHandler(async (req, 
 
 // Create Stripe Connect onboarding link
 router.post('/driver/connect/onboard', requireUserType('driver'), asyncHandler(async (req, res) => {
+  if (!ensureStripeConfigured(res)) return;
+
   let driver = await prisma.driver.findUnique({ where: { id: req.user.id } });
   
   // Create Stripe Connect account if not exists
@@ -136,6 +189,8 @@ router.post('/driver/connect/onboard', requireUserType('driver'), asyncHandler(a
 
 // Check Connect account status
 router.get('/driver/connect/status', requireUserType('driver'), asyncHandler(async (req, res) => {
+  if (!ensureStripeConfigured(res)) return;
+
   const driver = await prisma.driver.findUnique({ where: { id: req.user.id } });
   
   if (!driver.stripeAccountId) {
@@ -177,6 +232,8 @@ router.get('/driver/balance', requireUserType('driver'), asyncHandler(async (req
 
 // Request instant payout
 router.post('/driver/payout/instant', requireUserType('driver'), asyncHandler(async (req, res) => {
+  if (!ensureStripeConfigured(res)) return;
+
   const driver = await prisma.driver.findUnique({ where: { id: req.user.id } });
   
   if (!driver.stripeOnboarded) {

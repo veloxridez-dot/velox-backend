@@ -5,10 +5,38 @@
 
 const prisma = require('../config/prisma');
 
+async function assertRideParticipant(rideId, userId, userType) {
+  if (!['user', 'driver'].includes(userType)) {
+    throw new Error('Not authorized');
+  }
+
+  const ride = await prisma.ride.findUnique({
+    where: { id: rideId },
+    select: { id: true, userId: true, driverId: true }
+  });
+
+  if (!ride) {
+    throw new Error('Ride not found');
+  }
+
+  if (userType === 'user' && ride.userId !== userId) {
+    throw new Error('Not authorized');
+  }
+  if (userType === 'driver' && ride.driverId !== userId) {
+    throw new Error('Not authorized');
+  }
+
+  return ride;
+}
+
 /**
  * Send a message in a ride conversation
  */
 async function sendMessage(rideId, senderId, senderType, content) {
+  if (!['user', 'driver'].includes(senderType)) {
+    throw new Error('Not authorized to send messages');
+  }
+
   // Validate ride exists and is active
   const ride = await prisma.ride.findUnique({
     where: { id: rideId },
@@ -67,21 +95,7 @@ async function sendMessage(rideId, senderId, senderType, content) {
  * Get messages for a ride
  */
 async function getMessages(rideId, userId, userType) {
-  // Verify user is part of the ride
-  const ride = await prisma.ride.findUnique({
-    where: { id: rideId }
-  });
-  
-  if (!ride) {
-    throw new Error('Ride not found');
-  }
-  
-  if (userType === 'user' && ride.userId !== userId) {
-    throw new Error('Not authorized');
-  }
-  if (userType === 'driver' && ride.driverId !== userId) {
-    throw new Error('Not authorized');
-  }
+  await assertRideParticipant(rideId, userId, userType);
   
   const messages = await prisma.message.findMany({
     where: { rideId },
@@ -125,7 +139,9 @@ async function markDelivered(messageIds) {
 /**
  * Get unread message count for a ride
  */
-async function getUnreadCount(rideId, userId) {
+async function getUnreadCount(rideId, userId, userType) {
+  await assertRideParticipant(rideId, userId, userType);
+
   return prisma.message.count({
     where: {
       rideId,
@@ -133,6 +149,38 @@ async function getUnreadCount(rideId, userId) {
       status: { not: 'READ' }
     }
   });
+}
+
+/**
+ * Mark specific messages as read after validating ride access
+ */
+async function markMessagesRead(rideId, messageIds, userId, userType) {
+  const ride = await assertRideParticipant(rideId, userId, userType);
+
+  if (!Array.isArray(messageIds) || messageIds.length === 0) {
+    return { count: 0, ride };
+  }
+
+  const scopedMessages = await prisma.message.findMany({
+    where: {
+      id: { in: messageIds },
+      rideId,
+      senderId: { not: userId }
+    },
+    select: { id: true }
+  });
+
+  if (!scopedMessages.length) {
+    return { count: 0, ride };
+  }
+
+  const ids = scopedMessages.map(m => m.id);
+  const result = await prisma.message.updateMany({
+    where: { id: { in: ids }, status: { not: 'READ' } },
+    data: { status: 'READ', readAt: new Date() }
+  });
+
+  return { count: result.count, ride };
 }
 
 /**
@@ -189,39 +237,43 @@ function setupMessageSocketHandlers(io, socket) {
   
   // Mark as read
   socket.on('message:read', async (data) => {
-    const { rideId, messageIds } = data;
-    await prisma.message.updateMany({
-      where: { id: { in: messageIds } },
-      data: { status: 'READ', readAt: new Date() }
-    });
-    
-    // Notify sender that messages were read
-    const ride = await prisma.ride.findUnique({ where: { id: rideId } });
-    if (ride) {
-      const recipientId = socket.user.type === 'user' ? ride.driverId : ride.userId;
-      const recipientType = socket.user.type === 'user' ? 'driver' : 'user';
-      
-      io.to(`${recipientType}:${recipientId}`).emit('message:read_receipt', {
-        rideId,
-        messageIds
-      });
+    try {
+      const { rideId, messageIds } = data;
+      const result = await markMessagesRead(rideId, messageIds, socket.user.id, socket.user.type);
+
+      if (result.count > 0) {
+        const recipientId = socket.user.type === 'user' ? result.ride.driverId : result.ride.userId;
+        const recipientType = socket.user.type === 'user' ? 'driver' : 'user';
+
+        if (recipientId) {
+          io.to(`${recipientType}:${recipientId}`).emit('message:read_receipt', {
+            rideId,
+            messageIds
+          });
+        }
+      }
+    } catch (err) {
+      socket.emit('message:error', { error: err.message });
     }
   });
   
   // Typing indicator
   socket.on('message:typing', async (data) => {
-    const { rideId, isTyping } = data;
-    
-    const ride = await prisma.ride.findUnique({ where: { id: rideId } });
-    if (ride) {
+    try {
+      const { rideId, isTyping } = data;
+      const ride = await assertRideParticipant(rideId, socket.user.id, socket.user.type);
       const recipientId = socket.user.type === 'user' ? ride.driverId : ride.userId;
       const recipientType = socket.user.type === 'user' ? 'driver' : 'user';
-      
-      io.to(`${recipientType}:${recipientId}`).emit('message:typing', {
-        rideId,
-        isTyping,
-        senderType: socket.user.type
-      });
+
+      if (recipientId) {
+        io.to(`${recipientType}:${recipientId}`).emit('message:typing', {
+          rideId,
+          isTyping: Boolean(isTyping),
+          senderType: socket.user.type
+        });
+      }
+    } catch (err) {
+      socket.emit('message:error', { error: err.message });
     }
   });
 }
@@ -230,6 +282,7 @@ module.exports = {
   sendMessage,
   getMessages,
   markDelivered,
+  markMessagesRead,
   getUnreadCount,
   getQuickMessages,
   setupMessageSocketHandlers,

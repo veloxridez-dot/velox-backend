@@ -4,27 +4,77 @@
  */
 
 const express = require('express');
+const rateLimit = require('express-rate-limit');
+const { body, param, validationResult } = require('express-validator');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
 const router = express.Router();
 const prisma = require('../config/prisma');
 const redis = require('../config/redis');
 const { asyncHandler } = require('../middleware/errorHandler');
 const { authenticateAdmin } = require('../middleware/auth');
+const { safeCompare, getJwtSecret } = require('../config/security');
 
-// Simple admin auth for demo (in production, use proper admin system)
-router.post('/login', asyncHandler(async (req, res) => {
+const adminLoginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  message: { error: 'Too many admin login attempts. Try again later.' },
+  standardHeaders: true,
+  legacyHeaders: false
+});
+
+function parsePagination(limit, offset) {
+  const parsedLimit = Number.parseInt(limit, 10);
+  const parsedOffset = Number.parseInt(offset, 10);
+
+  return {
+    limit: Number.isNaN(parsedLimit) ? 50 : Math.min(Math.max(parsedLimit, 1), 100),
+    offset: Number.isNaN(parsedOffset) ? 0 : Math.max(parsedOffset, 0)
+  };
+}
+
+router.post('/login',
+  adminLoginLimiter,
+  body('email').isEmail().withMessage('Valid admin email is required'),
+  body('password').isString().isLength({ min: 1, max: 256 }).withMessage('Password is required'),
+  asyncHandler(async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ errors: errors.array() });
+  }
+
   const { email, password } = req.body;
-  
-  // Demo admin credentials (replace with proper auth in production)
-  if (email === 'admin@velox.com' && password === 'velox-admin-2024') {
-    const jwt = require('jsonwebtoken');
+  const configuredEmail = process.env.ADMIN_EMAIL;
+  const configuredPassword = process.env.ADMIN_PASSWORD;
+  const configuredPasswordHash = process.env.ADMIN_PASSWORD_HASH;
+
+  if (!configuredEmail || (!configuredPassword && !configuredPasswordHash)) {
+    return res.status(503).json({
+      error: 'Admin authentication is not configured'
+    });
+  }
+
+  const normalizedEmail = email.trim().toLowerCase();
+  const expectedEmail = configuredEmail.trim().toLowerCase();
+  const emailMatches = safeCompare(normalizedEmail, expectedEmail);
+
+  let passwordMatches = false;
+  if (configuredPasswordHash) {
+    passwordMatches = await bcrypt.compare(password, configuredPasswordHash).catch(() => false);
+  }
+  if (!passwordMatches && configuredPassword) {
+    passwordMatches = safeCompare(password, configuredPassword);
+  }
+
+  if (emailMatches && passwordMatches) {
     const token = jwt.sign(
-      { id: 'admin-1', type: 'admin', email, role: 'super_admin' },
-      process.env.JWT_SECRET,
+      { id: 'admin-1', type: 'admin', email: expectedEmail, role: 'super_admin' },
+      getJwtSecret(),
       { expiresIn: '24h' }
     );
     return res.json({ success: true, token });
   }
-  
+
   res.status(401).json({ error: 'Invalid credentials' });
 }));
 
@@ -65,6 +115,7 @@ router.get('/stats', authenticateAdmin, asyncHandler(async (req, res) => {
 // Get all drivers
 router.get('/drivers', authenticateAdmin, asyncHandler(async (req, res) => {
   const { status, limit = 50, offset = 0 } = req.query;
+  const pagination = parsePagination(limit, offset);
   
   const where = status ? { status } : {};
   
@@ -72,8 +123,8 @@ router.get('/drivers', authenticateAdmin, asyncHandler(async (req, res) => {
     prisma.driver.findMany({
       where,
       orderBy: { createdAt: 'desc' },
-      take: parseInt(limit),
-      skip: parseInt(offset),
+      take: pagination.limit,
+      skip: pagination.offset,
       select: {
         id: true, email: true, phone: true, firstName: true, lastName: true,
         rating: true, totalRides: true, status: true, isOnline: true,
@@ -88,10 +139,23 @@ router.get('/drivers', authenticateAdmin, asyncHandler(async (req, res) => {
 }));
 
 // Approve/reject driver
-router.post('/drivers/:id/status', authenticateAdmin, asyncHandler(async (req, res) => {
+router.post('/drivers/:id/status', authenticateAdmin,
+  param('id').isUUID(),
+  body('status').isIn(['APPROVED', 'REJECTED', 'SUSPENDED']).withMessage('Invalid status'),
+  body('reason').optional().isString().isLength({ max: 1000 }),
+  asyncHandler(async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ errors: errors.array() });
+  }
+
   const { id } = req.params;
   const { status, reason } = req.body; // APPROVED, REJECTED, SUSPENDED
-  
+
+  if ((status === 'REJECTED' || status === 'SUSPENDED') && !reason) {
+    return res.status(400).json({ error: 'A reason is required for rejected or suspended drivers' });
+  }
+
   const updateData = { status };
   if (status === 'APPROVED') updateData.approvedAt = new Date();
   
@@ -105,6 +169,7 @@ router.post('/drivers/:id/status', authenticateAdmin, asyncHandler(async (req, r
 // Get all rides
 router.get('/rides', authenticateAdmin, asyncHandler(async (req, res) => {
   const { status, limit = 50, offset = 0 } = req.query;
+  const pagination = parsePagination(limit, offset);
   
   const where = status ? { status } : {};
   
@@ -112,8 +177,8 @@ router.get('/rides', authenticateAdmin, asyncHandler(async (req, res) => {
     prisma.ride.findMany({
       where,
       orderBy: { createdAt: 'desc' },
-      take: parseInt(limit),
-      skip: parseInt(offset),
+      take: pagination.limit,
+      skip: pagination.offset,
       include: {
         user: { select: { firstName: true, lastName: true } },
         driver: { select: { firstName: true, lastName: true } }
@@ -166,16 +231,28 @@ router.get('/promos', authenticateAdmin, asyncHandler(async (req, res) => {
   res.json({ promos });
 }));
 
-router.post('/promos', authenticateAdmin, asyncHandler(async (req, res) => {
+router.post('/promos', authenticateAdmin,
+  body('code').isString().trim().isLength({ min: 3, max: 32 }),
+  body('type').isIn(['FIXED', 'PERCENTAGE']),
+  body('value').isFloat({ gt: 0 }),
+  body('maxDiscount').optional().isFloat({ gt: 0 }),
+  body('usageLimit').optional().isInt({ gt: 0 }),
+  body('validUntil').optional().isISO8601(),
+  asyncHandler(async (req, res) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ errors: errors.array() });
+  }
+
   const { code, type, value, maxDiscount, usageLimit, validUntil } = req.body;
   
   const promo = await prisma.promoCode.create({
     data: {
       code: code.toUpperCase(),
       type,
-      value,
-      maxDiscount,
-      usageLimit,
+      value: Number(value),
+      maxDiscount: maxDiscount !== undefined ? Number(maxDiscount) : null,
+      usageLimit: usageLimit !== undefined ? Number.parseInt(usageLimit, 10) : null,
       validUntil: validUntil ? new Date(validUntil) : null
     }
   });

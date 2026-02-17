@@ -5,8 +5,9 @@
 
 const jwt = require('jsonwebtoken');
 const prisma = require('../config/prisma');
+const { getJwtSecret } = require('../config/security');
 
-const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key';
+const JWT_SECRET = getJwtSecret();
 
 /**
  * Verify JWT token and attach user to request
@@ -21,6 +22,9 @@ async function authenticateToken(req, res, next) {
 
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
+    if (!decoded?.id || !['user', 'driver'].includes(decoded.type)) {
+      return res.status(403).json({ error: 'Invalid token type' });
+    }
     
     // Attach user info to request
     req.user = {
@@ -73,6 +77,10 @@ async function optionalAuth(req, res, next) {
 
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
+    if (!decoded?.id || !['user', 'driver'].includes(decoded.type)) {
+      return next();
+    }
+
     req.user = {
       id: decoded.id,
       type: decoded.type,
@@ -117,7 +125,7 @@ async function authenticateAdmin(req, res, next) {
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
     
-    if (decoded.type !== 'admin') {
+    if (decoded.type !== 'admin' || !decoded.id) {
       return res.status(403).json({ error: 'Admin access required' });
     }
     
@@ -158,6 +166,9 @@ function verifyRefreshToken(token) {
     const decoded = jwt.verify(token, JWT_SECRET);
     if (decoded.tokenType !== 'refresh') {
       throw new Error('Invalid token type');
+    }
+    if (!['user', 'driver'].includes(decoded.type) || !decoded.id) {
+      throw new Error('Invalid subject');
     }
     return decoded;
   } catch (err) {
