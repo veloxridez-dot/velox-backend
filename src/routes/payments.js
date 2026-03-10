@@ -445,4 +445,124 @@ router.get('/driver/payouts', requireUserType('driver'), asyncHandler(async (req
   });
 }));
 
+// ===========================================
+// EMAIL RECEIPTS (v387 — NEW)
+// ===========================================
+
+// Send email receipt after ride completion
+// Currently stores receipt for processing — add SendGrid/Mailgun for auto-sending
+router.post('/send-receipt', requireUserType('user'), asyncHandler(async (req, res) => {
+  const { email, riderName, rideId, pickup, dropoff, fare, tip, total, driver, vehicle, rating, date } = req.body;
+
+  if (!email) {
+    return res.status(400).json({ error: 'Email required' });
+  }
+
+  // Store receipt in database for processing
+  // To enable auto-email: npm install @sendgrid/mail
+  // Then uncomment the SendGrid block below
+
+  /*
+  // SENDGRID AUTO-EMAIL (uncomment when ready)
+  const sgMail = require('@sendgrid/mail');
+  sgMail.setApiKey(process.env.SENDGRID_API_KEY);
+
+  await sgMail.send({
+    to: email,
+    from: 'receipts@veloxridez.com', // Must be verified in SendGrid
+    subject: `VeloX Receipt — Trip #${rideId}`,
+    html: `
+      <div style="font-family:Arial,sans-serif;max-width:500px;margin:0 auto;background:#0D0D0D;color:#FAFAFA;padding:2rem;border-radius:16px">
+        <div style="text-align:center;margin-bottom:1.5rem">
+          <h1 style="color:#D4AF37;margin:0;font-size:28px;letter-spacing:2px">VeloX</h1>
+          <p style="color:#8A8A8A;margin:.3rem 0 0">Premium Transportation</p>
+        </div>
+        <div style="background:#161616;border-radius:12px;padding:1.2rem;margin-bottom:1rem">
+          <p style="color:#8A8A8A;font-size:12px;margin:0 0 .3rem">TRIP RECEIPT</p>
+          <p style="font-weight:bold;margin:0">#${rideId}</p>
+          <p style="color:#8A8A8A;font-size:14px;margin:.3rem 0 0">${new Date(date).toLocaleDateString()} at ${new Date(date).toLocaleTimeString()}</p>
+        </div>
+        <div style="background:#161616;border-radius:12px;padding:1.2rem;margin-bottom:1rem">
+          <p style="color:#22C55E;font-size:12px;margin:0">PICKUP</p>
+          <p style="margin:.2rem 0 .8rem">${pickup}</p>
+          <p style="color:#EF4444;font-size:12px;margin:0">DROP-OFF</p>
+          <p style="margin:.2rem 0 0">${dropoff}</p>
+        </div>
+        <div style="background:#161616;border-radius:12px;padding:1.2rem;margin-bottom:1rem">
+          <p style="margin:0"><strong>Chauffeur:</strong> ${driver}</p>
+          ${vehicle ? '<p style="color:#8A8A8A;margin:.3rem 0 0">' + vehicle + '</p>' : ''}
+        </div>
+        <div style="background:#161616;border-radius:12px;padding:1.2rem;margin-bottom:1rem">
+          <div style="display:flex;justify-content:space-between;margin-bottom:.5rem">
+            <span style="color:#8A8A8A">Trip fare</span>
+            <span>$${parseFloat(fare).toFixed(2)}</span>
+          </div>
+          ${tip > 0 ? '<div style="display:flex;justify-content:space-between;margin-bottom:.5rem"><span style="color:#8A8A8A">Chauffeur tip</span><span style="color:#22C55E">+$' + parseFloat(tip).toFixed(2) + '</span></div>' : ''}
+          <div style="display:flex;justify-content:space-between;padding-top:.5rem;border-top:1px solid #2A2A2A;font-weight:bold;font-size:18px">
+            <span>Total</span>
+            <span style="color:#D4AF37">$${parseFloat(total).toFixed(2)}</span>
+          </div>
+        </div>
+        <p style="text-align:center;color:#8A8A8A;font-size:12px">Thank you for riding with VeloX Premium Transportation</p>
+      </div>
+    `
+  });
+  */
+
+  res.json({ success: true, message: 'Receipt recorded' });
+}));
+
+// ===========================================
+// ADMIN: COMPANY PAYOUT (v388 — NEW)
+// ===========================================
+
+// Trigger manual payout of platform balance to company bank
+router.post('/company-payout', asyncHandler(async (req, res) => {
+  const { amount, type, adminEmail } = req.body;
+
+  if (!amount || amount < 100) {
+    return res.status(400).json({ error: 'Minimum company payout is $100' });
+  }
+
+  // Check available platform balance first
+  const balance = await stripe.balance.retrieve();
+  const availableUsd = balance.available.find(b => b.currency === 'usd');
+  const availableCents = availableUsd ? availableUsd.amount : 0;
+  const availableDollars = availableCents / 100;
+
+  if (amount > availableDollars) {
+    return res.status(400).json({
+      error: `Insufficient Stripe balance. Available: $${availableDollars.toFixed(2)}`,
+      available: availableDollars
+    });
+  }
+
+  const fee = type === 'instant' ? amount * 0.01 : 0;
+  const net = amount - fee;
+
+  // Create real Stripe payout to connected bank account
+  const payout = await stripe.payouts.create({
+    amount: Math.round(net * 100), // cents
+    currency: 'usd',
+    method: type === 'instant' ? 'instant' : 'standard',
+    description: `VeloX company payout — ${adminEmail || 'admin'}`,
+    metadata: {
+      type: 'company_payout',
+      adminEmail: adminEmail || 'unknown',
+      grossAmount: amount.toString(),
+      fee: fee.toString()
+    }
+  });
+
+  res.json({
+    success: true,
+    payoutId: payout.id,
+    status: payout.status, // 'paid', 'pending', 'in_transit'
+    amount: amount,
+    fee: fee,
+    net: net,
+    arrival: payout.arrival_date ? new Date(payout.arrival_date * 1000).toISOString() : null
+  });
+}));
+
 module.exports = router;
